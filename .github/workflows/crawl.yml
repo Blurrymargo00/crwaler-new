@@ -1,0 +1,84 @@
+name: crawl
+
+on:
+  workflow_dispatch:
+    inputs:
+      reset_progress:
+        description: "전역 인덱스 초기화 (위험! '1' 입력 시에만, worker 1 만 실행)"
+        required: false
+        default: "0"
+      retry_failed_only:
+        description: "실패 키워드만 재시도 ('1' 입력 시 run_all 대신 retry_failed 실행)"
+        required: false
+        default: "0"
+
+# 동일 워크플로 중복 실행 방지
+concurrency:
+  group: crawl-main
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # ~5h 50m (job 한도 6h 직전)
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: [1, 2, 3]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Write Firebase credentials
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          mkdir -p /tmp/secrets
+          printf '%s' "$FIREBASE_SERVICE_ACCOUNT" > /tmp/secrets/firebase.json
+          # JSON 유효성 검증
+          python -c "import json; json.load(open('/tmp/secrets/firebase.json'))"
+          echo "Firebase credentials ready"
+
+      # worker 별 시작 시간 분산 — 네이버 측 동시 요청 폭증 방지
+      - name: Stagger start
+        run: |
+          OFFSET=$(( (${{ matrix.worker }} - 1) * 45 ))
+          echo "Staggering $OFFSET seconds..."
+          sleep $OFFSET
+
+      - name: Run crawler (full)
+        if: ${{ github.event.inputs.retry_failed_only != '1' }}
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: /tmp/secrets/firebase.json
+          COMMANDS_FILE: crawler_commands.txt
+          SLEEP_SEC: "90"
+          MAX_RETRIES: "3"
+          RETRY_BASE_SLEEP: "180"
+          MAX_RUNTIME_SEC: "20400"
+          SAVE_XLSX: "0"
+          # worker 1 만, reset_progress=1 인 경우에만 리셋
+          RESET_PROGRESS: ${{ matrix.worker == 1 && github.event.inputs.reset_progress == '1' && '1' || '0' }}
+        run: python run_all.py
+
+      - name: Run crawler (retry failed only)
+        if: ${{ github.event.inputs.retry_failed_only == '1' && matrix.worker == 1 }}
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: /tmp/secrets/firebase.json
+          SLEEP_SEC: "120"
+          MAX_RUNTIME_SEC: "20400"
+          DEFAULT_MAX: "20"
+        run: python retry_failed.py
+
+      - name: Cleanup secrets
+        if: always()
+        run: rm -f /tmp/secrets/firebase.json
