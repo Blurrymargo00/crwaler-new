@@ -5,6 +5,10 @@ Firestore 연결, 스키마 변환, 진행 상태 관리.
 
 스키마:
   places/{place_id}              ← 업체 정보 (place_id 로 dedup)
+    region_code, region_name         ← 일반: "01"/"서울"
+                                       경기 동 단위: "0927"/"파주시"
+    sub_region_code, sub_region_name ← 일반: "0101"/"강남구"
+                                       경기 동 단위: "092711"/"교하동"
   crawl_jobs/{keyword_id}        ← 키워드별 처리 상태
   crawl_state/global             ← 전역 진행 인덱스
 """
@@ -51,7 +55,6 @@ PLACE_ID_RE = re.compile(r"/place/(\d+)")
 
 
 def extract_place_id(detail_url: str) -> Optional[str]:
-    """상세페이지URL에서 place_id 추출."""
     if not detail_url or not isinstance(detail_url, str):
         return None
     m = PLACE_ID_RE.search(detail_url)
@@ -59,12 +62,10 @@ def extract_place_id(detail_url: str) -> Optional[str]:
 
 
 def normalize_keyword(keyword: str) -> str:
-    """Firestore document ID 로 안전하게 변환."""
     return keyword.strip().replace(" ", "_").replace("/", "_")
 
 
 def clean_value(v):
-    """NaN, inf → None. 빈 문자열 → None."""
     if v is None:
         return None
     if isinstance(v, float):
@@ -106,9 +107,7 @@ FIELD_MAP = {
 
 
 def placerow_to_doc(row_dict: dict) -> Optional[tuple[str, dict]]:
-    """PlaceRow.to_dict() 결과 → (place_id, firestore doc dict).
-    place_id 추출 실패 시 이름+주소 해시로 폴백.
-    """
+    """PlaceRow.to_dict() 결과 → (place_id, firestore doc dict)."""
     detail_url = clean_value(row_dict.get("상세페이지URL"))
     place_id = extract_place_id(detail_url) if detail_url else None
 
@@ -132,14 +131,18 @@ def placerow_to_doc(row_dict: dict) -> Optional[tuple[str, dict]]:
 
 
 # ---------------------------------------------------------------------------
-# Firestore 쓰기
+# Firestore 쓰기 — region 정보 함께 저장
 # ---------------------------------------------------------------------------
 
-def upload_rows_to_firestore(rows: list, keyword: str) -> dict:
-    """PlaceRow 리스트 → places 컬렉션 batch upsert.
-
-    한 업체가 여러 키워드에 잡히는 경우 keywords 배열에 누적 (ArrayUnion).
-    """
+def upload_rows_to_firestore(
+    rows: list,
+    keyword: str,
+    region_code: Optional[str] = None,
+    region_name: Optional[str] = None,
+    sub_region_code: Optional[str] = None,
+    sub_region_name: Optional[str] = None,
+) -> dict:
+    """PlaceRow 리스트 → places 컬렉션 batch upsert + region 필드 주입."""
     db = get_db()
     uploaded = 0
     skipped = 0
@@ -158,6 +161,14 @@ def upload_rows_to_firestore(rows: list, keyword: str) -> dict:
         place_id, doc = result
         place_ids.append(place_id)
 
+        # region 정보 — 매핑 성공한 필드만 set (None 은 Firestore 에 null 로 저장됨)
+        if region_code is not None:
+            doc["region_code"] = region_code
+            doc["region_name"] = region_name
+        if sub_region_code is not None:
+            doc["sub_region_code"] = sub_region_code
+            doc["sub_region_name"] = sub_region_name
+
         doc["keywords"] = ArrayUnion([keyword])
         doc["updated_at"] = SERVER_TIMESTAMP
 
@@ -166,7 +177,7 @@ def upload_rows_to_firestore(rows: list, keyword: str) -> dict:
         batch_count += 1
         uploaded += 1
 
-        if batch_count >= 400:  # Firestore 배치 한도 500, 안전 마진
+        if batch_count >= 400:
             batch.commit()
             batch = db.batch()
             batch_count = 0
@@ -177,16 +188,27 @@ def upload_rows_to_firestore(rows: list, keyword: str) -> dict:
     return {"uploaded": uploaded, "skipped": skipped, "place_ids": place_ids}
 
 
-def mark_job_done(keyword: str, place_count: int, place_ids: list[str]) -> None:
+def mark_job_done(
+    keyword: str,
+    place_count: int,
+    place_ids: list[str],
+    region_code: Optional[str] = None,
+    sub_region_code: Optional[str] = None,
+) -> None:
     db = get_db()
     job_id = normalize_keyword(keyword)
-    db.collection("crawl_jobs").document(job_id).set({
+    payload = {
         "keyword": keyword,
         "status": "done",
         "place_count": place_count,
         "place_ids_sample": place_ids[:50],
         "last_attempt_at": SERVER_TIMESTAMP,
-    }, merge=True)
+    }
+    if region_code is not None:
+        payload["region_code"] = region_code
+    if sub_region_code is not None:
+        payload["sub_region_code"] = sub_region_code
+    db.collection("crawl_jobs").document(job_id).set(payload, merge=True)
 
 
 def mark_job_failed(keyword: str, error: str, retries: int) -> None:
@@ -254,7 +276,6 @@ def get_progress() -> dict:
 
 
 def reset_progress() -> None:
-    """전역 인덱스 초기화. is_keyword_done 가 중복 방지하므로 데이터 안전."""
     db = get_db()
     db.document(STATE_DOC_PATH).set({
         "last_claimed_index": -1,

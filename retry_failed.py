@@ -5,11 +5,11 @@ crawl_jobs 에서 status=='failed' 인 키워드만 골라 재실행.
 전역 인덱스와 무관하게 동작.
 
 환경변수:
-  SLEEP_SEC          기본 120 (실패한 애들이라 더 길게)
+  SLEEP_SEC          기본 120
   MAX_RETRIES        기본 3
   RETRY_BASE_SLEEP   기본 240
   MAX_RUNTIME_SEC    기본 20400
-  DEFAULT_MAX        기본 20 (max_items)
+  DEFAULT_MAX        기본 20
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import os
 import sys
 import time
 
+from region_mapper import map_keyword_to_region
 from firestore_store import (
     init_firebase,
     get_db,
@@ -58,13 +59,25 @@ def main() -> int:
             continue
 
         prev_retries = int(job.get("retries", 0))
-        log(f"▶  retry: {keyword} (prev_retries={prev_retries})")
+
+        region_code, region_name, sub_region_code, sub_region_name = map_keyword_to_region(keyword)
+        log(f"▶  retry: {keyword} (prev_retries={prev_retries}) [{region_code}/{sub_region_code}]")
 
         success, rows, err = run_one_keyword(keyword, DEFAULT_MAX)
         if success:
             try:
-                result = upload_rows_to_firestore(rows, keyword)
-                mark_job_done(keyword, result["uploaded"], result["place_ids"])
+                result = upload_rows_to_firestore(
+                    rows, keyword,
+                    region_code=region_code,
+                    region_name=region_name,
+                    sub_region_code=sub_region_code,
+                    sub_region_name=sub_region_name,
+                )
+                mark_job_done(
+                    keyword, result["uploaded"], result["place_ids"],
+                    region_code=region_code,
+                    sub_region_code=sub_region_code,
+                )
                 log(f"  ✅ {result['uploaded']}건")
                 ok += 1
             except Exception as e:

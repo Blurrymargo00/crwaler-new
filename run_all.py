@@ -2,14 +2,16 @@
 run_all.py
 
 crawler_commands.txt 의 각 명령을 전역 인덱스 기반으로 실행.
+키워드 → region 코드 매핑 후 Firestore에 함께 저장.
 
 동작:
   1. Firestore 트랜잭션으로 다음 인덱스를 원자적으로 클레임 (3-job 안전)
   2. 키워드가 이미 done 이면 skip (resume)
   3. naver_map_crawler.crawl() 직접 호출
-  4. 성공 → Firestore places + xlsx 백업
-  5. 실패(429 등) → 지수 백오프 재시도, 끝까지 실패 시 crawl_jobs 에 failed 기록
-  6. MAX_RUNTIME_SEC 초과 또는 명령 소진 시 안전 종료
+  4. region_mapper 로 지역 코드 매핑
+  5. 성공 → Firestore places + (옵션) xlsx 백업
+  6. 실패(429 등) → 지수 백오프 재시도
+  7. MAX_RUNTIME_SEC 초과 또는 명령 소진 시 안전 종료
 
 환경변수:
   COMMANDS_FILE       기본 crawler_commands.txt
@@ -28,9 +30,12 @@ import sys
 import time
 from datetime import datetime
 
-import naver_map_crawler as nmc
-from naver_map_crawler import crawl, save_excel
+import pandas as pd
 
+import naver_map_crawler as nmc
+from naver_map_crawler import crawl, EXCEL_COLUMNS
+
+from region_mapper import map_keyword_to_region
 from firestore_store import (
     init_firebase,
     claim_next_index,
@@ -58,14 +63,13 @@ def log(msg: str) -> None:
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
 
-# crawler_commands.txt 의 명령 형식:
+# crawler_commands.txt 명령 형식:
 #   python naver_map_crawler.py "서울 강남 입주청소" --max 20
-# 여기서 키워드와 max 만 뽑아온다.
 CMD_RE = re.compile(r'"\s*([^"]+?)\s*"\s*(?:--max\s+(\d+))?')
 
 
 def parse_command(cmd: str) -> tuple[str, int]:
-    """명령 라인에서 (keyword, max_items) 추출. max 없으면 50 (크롤러 기본값)."""
+    """명령 라인에서 (keyword, max_items) 추출."""
     m = CMD_RE.search(cmd)
     if not m:
         raise ValueError(f"명령 파싱 실패: {cmd}")
@@ -74,26 +78,16 @@ def parse_command(cmd: str) -> tuple[str, int]:
     return keyword, max_items
 
 
-def is_rate_limit_error(err: Exception) -> bool:
-    """429 / Too Many Requests 류 판별 (백오프 결정용)."""
-    s = str(err).lower()
-    return "429" in s or "too many requests" in s
-
-
 def run_one_keyword(keyword: str, max_items: int) -> tuple[bool, list, str]:
     """단일 키워드 크롤링 + 재시도.
 
     Returns: (success, rows, error_msg)
-      success=True 면 rows 는 PlaceRow 리스트
-      success=False 면 rows 는 빈 리스트, error_msg 에 마지막 에러
     """
     last_err = ""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             rows = crawl(keyword, max_items, fetch_detail=True, debug_dump=False)
             if not rows:
-                # 결과 0개. 429 일 수도 있고 진짜 없을 수도 있음.
-                # 일단 빈 결과를 실패로 간주하고 재시도.
                 last_err = "수집 결과 0건 (rate limit 또는 매칭 없음)"
             else:
                 return True, rows, ""
@@ -107,13 +101,57 @@ def run_one_keyword(keyword: str, max_items: int) -> tuple[bool, list, str]:
         if "429" in last_err or "결과 0건" in last_err:
             backoff = RETRY_BASE_SLEEP * (2 ** (attempt - 1))  # 180 → 360 → 720
         else:
-            backoff = 60 * attempt  # 일반 오류는 짧게
+            backoff = 60 * attempt
 
         log(f"  ⚠  실패(시도 {attempt}/{MAX_RETRIES}): {last_err[:200]}")
         log(f"  ⏳ {backoff}초 대기 후 재시도...")
         time.sleep(backoff)
 
     return False, [], last_err
+
+
+def save_excel_with_region(
+    rows: list,
+    path: str,
+    region_code: str | None,
+    region_name: str | None,
+    sub_region_code: str | None,
+    sub_region_name: str | None,
+) -> None:
+    """크롤러의 save_excel 과 동일하되, region 컬럼 4개 추가.
+
+    경기 동 단위(region_code 4자리): 지역코드=시군구코드, 지역명=시군구명, 시군구코드=읍면동코드, 시군구명=읍면동명
+    일반: 지역코드=시도코드, 지역명=시도명, 시군구코드=시군구코드, 시군구명=시군구명
+    """
+    is_gyeonggi_leaf = region_code and len(region_code) == 4 and region_code.startswith("09")
+
+    if is_gyeonggi_leaf:
+        col_names = ["시군구코드", "시군구명", "읍면동코드", "읍면동명"]
+    else:
+        col_names = ["지역코드", "지역명", "시군구코드", "시군구명"]
+
+    columns = EXCEL_COLUMNS + col_names
+
+    records = []
+    for r in rows:
+        d = r.to_dict() if hasattr(r, "to_dict") else r
+        d[col_names[0]] = region_code or ""
+        d[col_names[1]] = region_name or ""
+        d[col_names[2]] = sub_region_code or ""
+        d[col_names[3]] = sub_region_name or ""
+        records.append(d)
+
+    df = pd.DataFrame(records, columns=columns)
+    for col in ("방문자 리뷰수", "방문자 평점", "블로그 리뷰수", "사진리뷰수", "위도", "경도"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Sheet1")
+        ws = writer.sheets["Sheet1"]
+        for i, col in enumerate(df.columns, start=1):
+            ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = max(
+                12, min(40, len(col) + 4)
+            )
 
 
 def main() -> int:
@@ -123,7 +161,6 @@ def main() -> int:
         log("⚠  RESET_PROGRESS=1 — 진행 인덱스 초기화")
         reset_progress()
 
-    # 명령 로드
     with open(COMMANDS_FILE, "r", encoding="utf-8") as f:
         commands = [
             line.strip() for line in f
@@ -164,22 +201,53 @@ def main() -> int:
             skipped += 1
             continue
 
-        log(f"[idx={idx}] ▶  {keyword} (max={max_items})")
+        # region 매핑
+        region_code, region_name, sub_region_code, sub_region_name = map_keyword_to_region(keyword)
+        if not region_code:
+            log(f"[idx={idx}] ⚠  region 매칭 실패: {keyword!r} (그래도 진행)")
+        elif not sub_region_code:
+            log(f"[idx={idx}] ⚠  sub_region 매칭 실패: {keyword!r} → {region_name} (시/도만 매칭)")
+
+        # 경기 동 단위: region=시군구(4자리), sub_region=읍면동(6자리)
+        # 일반: region=시도(2자리), sub_region=시군구(4자리)
+        is_gyeonggi_leaf = region_code and len(region_code) == 4 and region_code.startswith("09")
+        if is_gyeonggi_leaf:
+            region_info = f"[경기/{region_name}/{sub_region_name or '??'}]"
+        else:
+            region_info = f"[{region_code or '??'}/{sub_region_code or '????'} {region_name or ''} {sub_region_name or ''}]".strip()
+        log(f"[idx={idx}] ▶  {keyword} (max={max_items}) {region_info}")
+
         success, rows, err = run_one_keyword(keyword, max_items)
 
         if success:
             try:
-                result = upload_rows_to_firestore(rows, keyword)
-                mark_job_done(keyword, result["uploaded"], result["place_ids"])
-                log(f"  ✅ Firestore: {result['uploaded']}건 업로드 (skip {result['skipped']})")
+                result = upload_rows_to_firestore(
+                    rows,
+                    keyword,
+                    region_code=region_code,
+                    region_name=region_name,
+                    sub_region_code=sub_region_code,
+                    sub_region_name=sub_region_name,
+                )
+                mark_job_done(
+                    keyword,
+                    result["uploaded"],
+                    result["place_ids"],
+                    region_code=region_code,
+                    sub_region_code=sub_region_code,
+                )
+                log(f"  ✅ Firestore: {result['uploaded']}건 (skip {result['skipped']})")
                 succeeded += 1
 
-                # 백업 xlsx 저장 (옵션)
                 if SAVE_XLSX:
                     filename = keyword.replace(" ", "_")
                     xlsx_path = os.path.join(OUTPUT_DIR, f"{filename}.xlsx")
                     try:
-                        save_excel(rows, xlsx_path)
+                        save_excel_with_region(
+                            rows, xlsx_path,
+                            region_code, region_name,
+                            sub_region_code, sub_region_name,
+                        )
                     except Exception as e:
                         log(f"  ⚠  xlsx 저장 실패(무시): {e}")
             except Exception as e:
@@ -191,7 +259,6 @@ def main() -> int:
             mark_job_failed(keyword, err, MAX_RETRIES)
             failed += 1
 
-        # 다음 키워드 전 sleep — 남은 시간 체크
         remaining = MAX_RUNTIME_SEC - (time.time() - started)
         if remaining > SLEEP_SEC:
             time.sleep(SLEEP_SEC)
