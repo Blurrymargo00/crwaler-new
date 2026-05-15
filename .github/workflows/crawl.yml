@@ -1,7 +1,6 @@
 name: crawl
 
 on:
-  # 수동 실행 (테스트용)
   workflow_dispatch:
     inputs:
       reset_progress:
@@ -13,15 +12,6 @@ on:
         required: false
         default: "0"
 
-  # 자동 실행 — KST 기준 09:00 / 15:00 / 21:00 (3회/일)
-  # GitHub Actions 는 UTC 기준이라 -9시간
-  schedule:
-    - cron: "0 0 * * *"    # UTC 00:00 = KST 09:00
-    - cron: "0 6 * * *"    # UTC 06:00 = KST 15:00
-    - cron: "0 12 * * *"   # UTC 12:00 = KST 21:00
-
-# 동일 워크플로 중복 실행 방지
-# cron 과 수동 트리거가 겹쳐도 한쪽이 끝날 때까지 대기
 concurrency:
   group: crawl-main
   cancel-in-progress: false
@@ -33,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        worker: [1, 2]    # 429 줄이기 위해 3 → 2개
+        worker: [1, 2, 3]
 
     steps:
       - name: Checkout
@@ -57,10 +47,9 @@ jobs:
           python -c "import json; json.load(open('/tmp/secrets/firebase.json'))"
           echo "Firebase credentials ready"
 
-      # worker 별 시작 시간 어긋남 — 동시 네이버 요청 폭증 방지
       - name: Stagger start
         run: |
-          OFFSET=$(( (${{ matrix.worker }} - 1) * 60 ))
+          OFFSET=$(( (${{ matrix.worker }} - 1) * 45 ))
           echo "Staggering $OFFSET seconds..."
           sleep $OFFSET
 
@@ -69,20 +58,19 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: /tmp/secrets/firebase.json
           COMMANDS_FILE: crawler_commands.txt
-          SLEEP_SEC: "120"           # 90 → 120 (429 줄이기)
+          SLEEP_SEC: "90"
           MAX_RETRIES: "3"
           RETRY_BASE_SLEEP: "180"
           MAX_RUNTIME_SEC: "20400"
           SAVE_XLSX: "0"
-          # cron 실행에서는 절대 리셋 안 됨 (수동 + worker 1 + 명시적 1 입력 시에만)
-          RESET_PROGRESS: ${{ github.event_name == 'workflow_dispatch' && matrix.worker == 1 && github.event.inputs.reset_progress == '1' && '1' || '0' }}
+          RESET_PROGRESS: ${{ matrix.worker == 1 && github.event.inputs.reset_progress == '1' && '1' || '0' }}
         run: python run_all.py
 
       - name: Run crawler (retry failed only)
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.retry_failed_only == '1' && matrix.worker == 1 }}
+        if: ${{ github.event.inputs.retry_failed_only == '1' && matrix.worker == 1 }}
         env:
           GOOGLE_APPLICATION_CREDENTIALS: /tmp/secrets/firebase.json
-          SLEEP_SEC: "180"           # retry 는 더 보수적으로
+          SLEEP_SEC: "120"
           MAX_RUNTIME_SEC: "20400"
           DEFAULT_MAX: "20"
         run: python retry_failed.py
