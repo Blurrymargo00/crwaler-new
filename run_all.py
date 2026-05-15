@@ -72,6 +72,37 @@ def log(msg: str) -> None:
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
 
+def dump_naver_response(keyword: str) -> None:
+    """0건 실패 시 네이버 실제 응답 확인 — 차단 여부 판단용."""
+    import requests as _req
+    from urllib.parse import quote
+    url = f"https://pcmap.place.naver.com/place/list?query={quote(keyword)}&page=1"
+    try:
+        resp = _req.get(url, headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+            "Referer": "https://map.naver.com/",
+            "Accept-Language": "ko-KR,ko;q=0.9",
+        }, timeout=15)
+        body = resp.text
+        log(f"  🔍 [응답 진단] HTTP {resp.status_code} / {len(body)}bytes")
+        # 차단/정상 신호 탐지
+        checks = [
+            ("APOLLO_STATE",    "✅ 정상 (Apollo state 있음)"),
+            ("__NEXT_DATA__",   "✅ 정상 (Next.js data 있음)"),
+            ("비정상적인 접근",  "🚫 비정상 접근 차단"),
+            ("일시적으로 차단",  "🚫 일시 차단"),
+            ("잠시 후 다시",    "🚫 일시 차단"),
+            ("captcha",        "🚫 캡차 감지"),
+        ]
+        found = [label for signal, label in checks if signal.lower() in body.lower()]
+        if found:
+            log(f"  🔍 [응답 신호] {' | '.join(found)}")
+        else:
+            log(f"  🔍 [응답 신호] 판단 불가 — 앞 300자: {body[:300]}")
+    except Exception as e:
+        log(f"  🔍 [응답 진단 실패] {e}")
+
+
 # 연속 0건 실패 카운터 (모듈 레벨 — 같은 프로세스 내 공유)
 _consecutive_empty = 0
 BLOCK_THRESHOLD = 3      # 이 횟수 연속 0건이면 IP 차단으로 판단
@@ -97,6 +128,9 @@ def run_one_keyword(keyword: str, max_items: int) -> tuple[bool, list, str]:
             rows = crawl(keyword, max_items, fetch_detail=True, debug_dump=False)
             if not rows:
                 last_err = "수집 결과 0건"
+                # 첫 실패 시에만 응답 진단 (매번 하면 부하)
+                if attempt == 1:
+                    dump_naver_response(keyword)
             else:
                 _consecutive_empty = 0  # 성공 시 카운터 리셋
                 return True, rows, ""
