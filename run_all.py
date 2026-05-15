@@ -34,7 +34,16 @@ import pandas as pd
 import naver_map_crawler as nmc
 from naver_map_crawler import crawl, EXCEL_COLUMNS
 
-from command_parser import parse_command
+try:
+    from command_parser import parse_command
+except ModuleNotFoundError:
+    import re as _re
+    _CMD_RE = _re.compile(r'"\s*([^"]+?)\s*"\s*(?:--max\s+(\d+))?')
+    def parse_command(cmd: str) -> tuple[str, int]:
+        m = _CMD_RE.search(cmd)
+        if not m:
+            raise ValueError(f"명령 파싱 실패: {cmd}")
+        return m.group(1).strip(), int(m.group(2)) if m.group(2) else 50
 from region_mapper import map_keyword_to_region
 from firestore_store import (
     init_firebase,
