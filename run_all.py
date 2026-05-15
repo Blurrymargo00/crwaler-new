@@ -25,7 +25,6 @@ crawler_commands.txt 의 각 명령을 전역 인덱스 기반으로 실행.
 from __future__ import annotations
 
 import os
-import re
 import sys
 import time
 from datetime import datetime
@@ -35,6 +34,7 @@ import pandas as pd
 import naver_map_crawler as nmc
 from naver_map_crawler import crawl, EXCEL_COLUMNS
 
+from command_parser import parse_command
 from region_mapper import map_keyword_to_region
 from firestore_store import (
     init_firebase,
@@ -63,19 +63,10 @@ def log(msg: str) -> None:
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
 
-# crawler_commands.txt 명령 형식:
-#   python naver_map_crawler.py "서울 강남 입주청소" --max 20
-CMD_RE = re.compile(r'"\s*([^"]+?)\s*"\s*(?:--max\s+(\d+))?')
-
-
-def parse_command(cmd: str) -> tuple[str, int]:
-    """명령 라인에서 (keyword, max_items) 추출."""
-    m = CMD_RE.search(cmd)
-    if not m:
-        raise ValueError(f"명령 파싱 실패: {cmd}")
-    keyword = m.group(1).strip()
-    max_items = int(m.group(2)) if m.group(2) else 50
-    return keyword, max_items
+# 연속 0건 실패 카운터 (모듈 레벨 — 같은 프로세스 내 공유)
+_consecutive_empty = 0
+BLOCK_THRESHOLD = 3      # 이 횟수 연속 0건이면 IP 차단으로 판단
+BLOCK_SLEEP = 1800       # 차단 판단 시 대기 시간 (30분)
 
 
 def run_one_keyword(keyword: str, max_items: int) -> tuple[bool, list, str]:
@@ -83,29 +74,50 @@ def run_one_keyword(keyword: str, max_items: int) -> tuple[bool, list, str]:
 
     Returns: (success, rows, error_msg)
     """
+    global _consecutive_empty
+
+    # 연속 0건이 BLOCK_THRESHOLD 이상이면 IP 차단으로 판단 → 장시간 대기
+    if _consecutive_empty >= BLOCK_THRESHOLD:
+        log(f"  🚫 연속 {_consecutive_empty}회 0건 — IP 차단 의심. {BLOCK_SLEEP}초({BLOCK_SLEEP//60}분) 대기...")
+        time.sleep(BLOCK_SLEEP)
+        _consecutive_empty = 0  # 대기 후 리셋해서 다시 시도
+
     last_err = ""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             rows = crawl(keyword, max_items, fetch_detail=True, debug_dump=False)
             if not rows:
-                last_err = "수집 결과 0건 (rate limit 또는 매칭 없음)"
+                last_err = "수집 결과 0건"
             else:
+                _consecutive_empty = 0  # 성공 시 카운터 리셋
                 return True, rows, ""
         except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
+            err_str = str(e)
+            if "429" in err_str:
+                last_err = "429 Too Many Requests"
+            else:
+                last_err = f"{type(e).__name__}: {err_str}"
+            _consecutive_empty = 0  # 429는 명시적 에러라 차단 카운터와 별개
 
         if attempt >= MAX_RETRIES:
             break
 
-        # 429 의심 시 더 긴 백오프
-        if "429" in last_err or "결과 0건" in last_err:
+        if "429" in last_err:
             backoff = RETRY_BASE_SLEEP * (2 ** (attempt - 1))  # 180 → 360 → 720
+        elif "0건" in last_err:
+            # 0건은 짧게 1번만 재시도 — 차단 상태면 기다려도 의미 없음
+            backoff = 60
         else:
             backoff = 60 * attempt
 
         log(f"  ⚠  실패(시도 {attempt}/{MAX_RETRIES}): {last_err[:200]}")
         log(f"  ⏳ {backoff}초 대기 후 재시도...")
         time.sleep(backoff)
+
+    # 0건 실패 카운터 증가
+    if "0건" in last_err:
+        _consecutive_empty += 1
+        log(f"  📊 연속 0건 횟수: {_consecutive_empty}/{BLOCK_THRESHOLD}")
 
     return False, [], last_err
 
@@ -118,27 +130,17 @@ def save_excel_with_region(
     sub_region_code: str | None,
     sub_region_name: str | None,
 ) -> None:
-    """크롤러의 save_excel 과 동일하되, region 컬럼 4개 추가.
-
-    경기 동 단위(region_code 4자리): 지역코드=시군구코드, 지역명=시군구명, 시군구코드=읍면동코드, 시군구명=읍면동명
-    일반: 지역코드=시도코드, 지역명=시도명, 시군구코드=시군구코드, 시군구명=시군구명
-    """
-    is_gyeonggi_leaf = region_code and len(region_code) == 4 and region_code.startswith("09")
-
-    if is_gyeonggi_leaf:
-        col_names = ["시군구코드", "시군구명", "읍면동코드", "읍면동명"]
-    else:
-        col_names = ["지역코드", "지역명", "시군구코드", "시군구명"]
-
-    columns = EXCEL_COLUMNS + col_names
+    """크롤러의 save_excel 과 동일하되, region 컬럼 4개 추가."""
+    extra_cols = ["지역코드", "지역명", "시군구코드", "시군구명"]
+    columns = EXCEL_COLUMNS + extra_cols
 
     records = []
     for r in rows:
         d = r.to_dict() if hasattr(r, "to_dict") else r
-        d[col_names[0]] = region_code or ""
-        d[col_names[1]] = region_name or ""
-        d[col_names[2]] = sub_region_code or ""
-        d[col_names[3]] = sub_region_name or ""
+        d["지역코드"] = region_code or ""
+        d["지역명"] = region_name or ""
+        d["시군구코드"] = sub_region_code or ""
+        d["시군구명"] = sub_region_name or ""
         records.append(d)
 
     df = pd.DataFrame(records, columns=columns)
@@ -208,13 +210,7 @@ def main() -> int:
         elif not sub_region_code:
             log(f"[idx={idx}] ⚠  sub_region 매칭 실패: {keyword!r} → {region_name} (시/도만 매칭)")
 
-        # 경기 동 단위: region=시군구(4자리), sub_region=읍면동(6자리)
-        # 일반: region=시도(2자리), sub_region=시군구(4자리)
-        is_gyeonggi_leaf = region_code and len(region_code) == 4 and region_code.startswith("09")
-        if is_gyeonggi_leaf:
-            region_info = f"[경기/{region_name}/{sub_region_name or '??'}]"
-        else:
-            region_info = f"[{region_code or '??'}/{sub_region_code or '????'} {region_name or ''} {sub_region_name or ''}]".strip()
+        region_info = f"[{region_code or '??'}/{sub_region_code or '????'} {region_name or ''} {sub_region_name or ''}]".strip()
         log(f"[idx={idx}] ▶  {keyword} (max={max_items}) {region_info}")
 
         success, rows, err = run_one_keyword(keyword, max_items)
