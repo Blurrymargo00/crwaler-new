@@ -84,21 +84,42 @@ def dump_naver_response(keyword: str) -> None:
             "Accept-Language": "ko-KR,ko;q=0.9",
         }, timeout=15)
         body = resp.text
+        body_lower = body.lower()
         log(f"  🔍 [응답 진단] HTTP {resp.status_code} / {len(body)}bytes")
-        # 차단/정상 신호 탐지
-        checks = [
-            ("APOLLO_STATE",    "✅ 정상 (Apollo state 있음)"),
-            ("__NEXT_DATA__",   "✅ 정상 (Next.js data 있음)"),
-            ("비정상적인 접근",  "🚫 비정상 접근 차단"),
-            ("일시적으로 차단",  "🚫 일시 차단"),
-            ("잠시 후 다시",    "🚫 일시 차단"),
-            ("captcha",        "🚫 캡차 감지"),
-        ]
-        found = [label for signal, label in checks if signal.lower() in body.lower()]
-        if found:
-            log(f"  🔍 [응답 신호] {' | '.join(found)}")
-        else:
-            log(f"  🔍 [응답 신호] 판단 불가 — 앞 300자: {body[:300]}")
+
+        # Apollo state 안에 실제 장소 데이터 있는지 확인
+        has_apollo = "APOLLO_STATE" in body
+        has_place_data = any(p in body for p in [
+            "PlaceSummary:", "RestaurantListSummary:", "HairshopSummary:"
+        ])
+        # 실제 캡차 페이지 신호 (단순 텍스트 포함이 아닌 캡차 UI 신호)
+        real_captcha = any(p in body_lower for p in [
+            "naver_captcha", "captcha_key", "com.naver.captcha",
+            "chaptcha", "/captcha/",
+        ])
+        soft_block = any(p in body for p in [
+            "비정상적인 접근", "일시적으로 차단", "잠시 후 다시",
+            "접근이 제한", "비정상 접근",
+        ])
+
+        signals = []
+        if has_apollo and has_place_data:
+            signals.append("✅ Apollo state + 장소데이터 있음 (정상)")
+        elif has_apollo and not has_place_data:
+            signals.append("⚠️  Apollo state는 있으나 장소 데이터 없음 (빈 결과 or 차단)")
+        if real_captcha:
+            signals.append("🚫 실제 캡차 페이지 감지")
+        if soft_block:
+            signals.append("🚫 소프트 차단 감지")
+        if not signals:
+            signals.append(f"판단 불가")
+
+        log(f"  🔍 [응답 신호] {' | '.join(signals)}")
+
+        # 장소 데이터 없으면 body 앞부분 출력 (실제 내용 확인용)
+        if not has_place_data:
+            log(f"  🔍 [body 앞 400자] {body[:400]}")
+
     except Exception as e:
         log(f"  🔍 [응답 진단 실패] {e}")
 
