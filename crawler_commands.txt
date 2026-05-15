@@ -1,3 +1,3 @@
-python naver_map_crawler.py "서울 강남 입주청소" --max 20
-python naver_map_crawler.py "서울 강남 에어컨청소" --max 20
-python naver_map_crawler.py "서울 강남 하수구" --max 20
+python naver_map_crawler.py "서울 강동 입주청소" --max 20
+python naver_map_crawler.py "서울 강동 에어컨청소" --max 20
+python naver_map_crawler.py "서울 강동 하수구" --max 20
